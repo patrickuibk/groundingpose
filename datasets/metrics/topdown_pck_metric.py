@@ -1,14 +1,15 @@
 import numpy as np
 from typing import Sequence, Optional
 
-from mmpose.evaluation.metrics.keypoint_2d_metrics import PCKAccuracy
 from mmdet.registry import METRICS
 from tools.graph_matching import sequential_matching
 from collections import Counter
 
+from .grouped_pck_metric import GroupedPCKAccuracy
+
 
 @METRICS.register_module()
-class TopDownPCKAccuracy(PCKAccuracy):
+class TopDownPCKAccuracy(GroupedPCKAccuracy):
     """
     Top-down PCK metric for single-instance pose estimation per sample.
 
@@ -36,21 +37,18 @@ class TopDownPCKAccuracy(PCKAccuracy):
                  thr: float = 0.05,
                  collect_device: str = 'cpu',
                  prefix: Optional[str] = None,
-                 max_keypoints: int = 100,
                  **kwargs):
         """
         Args:
             thr (float): PCK threshold (as a fraction of bbox size).
             collect_device (str): Device for result collection.
             prefix (str, optional): Prefix for metric name.
-            max_keypoints (int): Maximum number of keypoints (for fixed output shape).
             **kwargs: Additional arguments for base class.
         """
         super().__init__(thr=thr,
                          norm_item='bbox',
                          collect_device=collect_device,
                          prefix=prefix)
-        self.max_keypoints = int(max_keypoints)
 
     def _build_gt(self, ann):
         """
@@ -152,15 +150,16 @@ class TopDownPCKAccuracy(PCKAccuracy):
             if len(gt_label_names) == 0:
                 continue
 
-            pred_label_names, pred_scores, pred_keypoints, pred_rel = self._get_preds(data_sample['pred_instances'], gt_label_names)
+            pred_label_names, pred_scores, pred_keypoints, pred_rel = self._get_preds(
+                data_sample['pred_instances'], gt_label_names)
 
-            # Local->global coords
+            # Local->global coords for predictions
             bx, by, bw, bh = ann['bbox']
             pred_keypoints = pred_keypoints.copy()
             pred_keypoints[:, 0] += bx
             pred_keypoints[:, 1] += by
 
-            # Label name -> int
+            # Label name -> int (sample-local) for matching only
             unique_names = set(gt_label_names) | set(pred_label_names)
             name_to_idx = {name: i for i, name in enumerate(sorted(unique_names))}
             gt_labels = np.array([name_to_idx[name] for name in gt_label_names])
@@ -175,24 +174,24 @@ class TopDownPCKAccuracy(PCKAccuracy):
                 pred_relation_matrices=pred_rel,
             )
 
-            # Build gt and prediction array with fixed global shape (max_keypoints, 3
-            gt_full = np.zeros((self.max_keypoints, 3), dtype=np.float32)
-            gt_full[:gt_keypoints.shape[0], :] = gt_keypoints
+            # Build per-sample variable-length arrays (no global indexing)
+            K = gt_keypoints.shape[0]
+            gt_coords = gt_keypoints[:, :2].reshape(1, K, 2)
+            pred_coords = np.zeros_like(gt_coords, dtype=np.float32)
 
-            pred_full = np.zeros((self.max_keypoints, 3), dtype=np.float32)
-            for gt_pos, pred_pos in match.items():
-                pred_full[gt_pos, 0] = pred_keypoints[pred_pos, 0]
-                pred_full[gt_pos, 1] = pred_keypoints[pred_pos, 1]
-                pred_full[gt_pos, 2] = pred_scores[pred_pos]
+            for gt_pos_local, pred_pos in match.items():
+                if 0 <= gt_pos_local < K and 0 <= pred_pos < pred_keypoints.shape[0]:
+                    pred_coords[0, gt_pos_local, 0] = pred_keypoints[pred_pos, 0]
+                    pred_coords[0, gt_pos_local, 1] = pred_keypoints[pred_pos, 1]
 
-            # Mask: visible GT entries are the first K rows we filled
-            mask = gt_full[:, 2] > 0
+            # Mask over visible GT keypoints (all True after visibility filtering)
+            mask = (gt_keypoints[:, 2] > 0).reshape(1, K)
 
             side = max(bw, bh)
             self.results.append({
-                'pred_coords': pred_full[:, :2].reshape(1, self.max_keypoints, 2),
-                'gt_coords': gt_full[:, :2].reshape(1, self.max_keypoints, 2),
-                'mask': mask.reshape(1, self.max_keypoints),
+                'pred_coords': pred_coords,
+                'gt_coords': gt_coords,
+                'mask': mask,
                 'bbox_size': np.array([[side, side]], dtype=np.float32),
                 'gt_instance_id': ann.get('id', -1),
                 'category_id': ann['category_id']

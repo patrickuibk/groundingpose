@@ -10,6 +10,8 @@ from tools.graph_grouping import (
     make_merge_fn_max_label,
 )
 from tools.graph_matching import sequential_matching
+from mmengine.logging import MMLogger
+from mmpose.evaluation.functional import keypoint_pck_accuracy
 
 
 @METRICS.register_module()
@@ -26,7 +28,6 @@ class GroupedPCKAccuracy(PCKAccuracy):
                  edge_score_thresh: float = 0.5,
                  collect_device: str = 'cpu',
                  prefix: Optional[str] = None,
-                 max_keypoints: int = 100,
                  **kwargs):
         super().__init__(thr=thr,
                          norm_item='bbox',
@@ -34,7 +35,6 @@ class GroupedPCKAccuracy(PCKAccuracy):
                          prefix=prefix)
         self.node_score_thresh = node_score_thresh
         self.edge_score_thresh = edge_score_thresh
-        self.max_keypoints = int(max_keypoints)
 
     def _per_label_max_from_gt(self,
                                meta: Dict[str, Any],
@@ -57,10 +57,6 @@ class GroupedPCKAccuracy(PCKAccuracy):
                 if name in pred_label_set:
                     max_per_label[name] = max(max_per_label.get(name, 0), int(c))
         
-        # Fallback for any predicted label not present in GT categories
-        for name in pred_label_set:
-            if max_per_label.get(name, 0) <= 0:
-                max_per_label[name] = self.max_keypoints
         return max_per_label
 
     def process(self, data_batch: Sequence[dict], data_samples: Sequence[dict]) -> None:
@@ -91,7 +87,12 @@ class GroupedPCKAccuracy(PCKAccuracy):
                 anns=anns,
                 pred_label_set=set(pred_label_names_set),
             )
-            per_label_max_ids = {name_to_id[n]: max_per_label_name[n] for n in pred_label_names_set}
+            # only include labels that exist in GT-derived maxima
+            per_label_max_ids = {
+                name_to_id[n]: max_per_label_name[n]
+                for n in pred_label_names_set
+                if n in max_per_label_name
+            }
 
             # Filter nodes by score
             node_mask = scores_full >= self.node_score_thresh
@@ -198,10 +199,10 @@ class GroupedPCKAccuracy(PCKAccuracy):
                     continue
 
                 # Pred group
-                pred_coords = group_coords[r]           # [Mp,2] already global
-                pred_scores = group_scores[r]           # [Mp]
-                pred_rel = group_rels[r]                # [Mp,Mp,C]
-                pred_names = group_label_names[r]       # [Mp]
+                pred_coords_grp = group_coords[r]           # [Mp,2] already global
+                pred_scores_grp = group_scores[r]           # [Mp]
+                pred_rel = group_rels[r]                    # [Mp,Mp,C]
+                pred_names = group_label_names[r]           # [Mp]
 
                 # Labels mapping
                 all_names = sorted(set(gt_label_names) | set(pred_names))
@@ -214,30 +215,79 @@ class GroupedPCKAccuracy(PCKAccuracy):
                     gt_labels=gt_labels,
                     gt_relation_matrices=gt_rel,
                     pred_labels=pred_labels,
-                    pred_scores=pred_scores,
+                    pred_scores=pred_scores_grp,
                     pred_relation_matrices=pred_rel,
                 )
 
-                # Padded arrays (as in topdown)
-                gt_full = np.zeros((self.max_keypoints, 3), dtype=np.float32)
-                place = min(Kg, self.max_keypoints)
-                gt_full[:place, :] = gt_kpts[:place, :]
-
-                pred_full = np.zeros((self.max_keypoints, 3), dtype=np.float32)
+                # Variable-length arrays aligned to GT order (no padding)
+                gt_coords = gt_kpts[:, :2].reshape(1, Kg, 2)
+                pred_coords = np.zeros_like(gt_coords, dtype=np.float32)
                 for gt_pos, pred_pos in match.items():
-                    if gt_pos < self.max_keypoints:
-                        pred_full[gt_pos, 0] = pred_coords[pred_pos, 0]
-                        pred_full[gt_pos, 1] = pred_coords[pred_pos, 1]
-                        pred_full[gt_pos, 2] = pred_scores[pred_pos]
+                    if 0 <= gt_pos < Kg and 0 <= pred_pos < pred_coords_grp.shape[0]:
+                        pred_coords[0, gt_pos, 0] = pred_coords_grp[pred_pos, 0]
+                        pred_coords[0, gt_pos, 1] = pred_coords_grp[pred_pos, 1]
 
-                mask = gt_full[:, 2] > 0
+                # Mask over visible GT keypoints
+                mask = (gt_kpts[:, 2] > 0).reshape(1, Kg)
+
                 side = float(max(ann['bbox'][2], ann['bbox'][3]))
-
                 self.results.append({
-                    'pred_coords': pred_full[:, :2].reshape(1, self.max_keypoints, 2),
-                    'gt_coords': gt_full[:, :2].reshape(1, self.max_keypoints, 2),
-                    'mask': mask.reshape(1, self.max_keypoints),
+                    'pred_coords': pred_coords,
+                    'gt_coords': gt_coords,
+                    'mask': mask,
                     'bbox_size': np.array([[side, side]], dtype=np.float32),
                     'gt_instance_id': gt_ids[c],
                     'category_id': gt_cat_ids[c],
                 })
+
+    def compute_metrics(self, results: list) -> Dict[str, float]:
+        # Group by category and compute macro-averaged PCK over categories
+        logger: MMLogger = MMLogger.get_current_instance()
+
+        # Build category -> indices mapping
+        cat_to_idxs: Dict[int, List[int]] = {}
+        for i, r in enumerate(results):
+            cid = r.get('category_id', -1)
+            cat_to_idxs.setdefault(cid, []).append(i)
+
+        metrics: Dict[str, float] = {}
+        per_cat_pck: List[float] = []
+
+        for cid, idxs in cat_to_idxs.items():
+            # Flatten all keypoints across samples in this category
+            pred_rows, gt_rows, mask_rows, norm_rows = [], [], [], []
+            for i in idxs:
+                pc = results[i]['pred_coords'][0]    # (K, 2)
+                gc = results[i]['gt_coords'][0]      # (K, 2)
+                m = results[i]['mask'][0].astype(bool)  # (K,)
+                if pc.shape[0] == 0:
+                    continue
+                pred_rows.append(pc)
+                gt_rows.append(gc)
+                mask_rows.append(m)
+                norm = results[i]['bbox_size'][0]    # (2,)
+                norm_rows.append(np.repeat(norm.reshape(1, 2), pc.shape[0], axis=0))
+
+            if not pred_rows:
+                continue
+
+            pred_all = np.concatenate(pred_rows, axis=0)   # (M, 2)
+            gt_all = np.concatenate(gt_rows, axis=0)       # (M, 2)
+            mask_all = np.concatenate(mask_rows, axis=0)   # (M,)
+            norm_all = np.concatenate(norm_rows, axis=0)   # (M, 2)
+
+            # Each keypoint as an instance (N=M, K=1)
+            pred_flat = pred_all.reshape(-1, 1, 2)
+            gt_flat = gt_all.reshape(-1, 1, 2)
+            mask_flat = mask_all.reshape(-1, 1)
+
+            logger.info(f'Evaluating {self.__class__.__name__} for category {cid} (normalized by "bbox_size")...')
+            _, pck, _ = keypoint_pck_accuracy(pred_flat, gt_flat, mask_flat, self.thr, norm_all)
+            metrics[f'PCK/cat_{cid}'] = pck
+            per_cat_pck.append(pck)
+
+        # Macro-average over categories
+        metrics['PCK'] = float(np.mean(per_cat_pck)) if per_cat_pck else 0.0
+        logger.info(f'Macro-averaged PCK over {len(per_cat_pck)} categories: {metrics["PCK"]:.4f}')
+
+        return metrics
