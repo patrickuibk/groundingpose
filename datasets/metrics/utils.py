@@ -183,6 +183,279 @@ def compute_precision(
 
 
 
+def compute_relation_precision(
+    gt_coords_list,
+    gt_labels_list,
+    gt_relations_list,
+    relation_names_list,
+    pred_coords_list,
+    pred_labels_list,
+    pred_scores_list,
+    pred_relations_list,
+    max_dim_list,
+    keypoint_score_threshold,
+    keypoint_distance_threshold,
+    relation_score_thresholds=None,
+    distances_list=None
+):
+    """
+    Precision over relation score thresholds.
+
+    - Filter predictions by keypoint_score_threshold.
+    - Assign predictions to closest GT with same label within keypoint_distance_threshold.
+    - Precision counts TP as predicted pairs that correspond to GT-positive pairs; others are FP.
+    """
+    if relation_score_thresholds is None:
+        relation_score_thresholds = np.arange(0, 1.06, 0.05)
+
+    thr_vec = _as_1d_array(relation_score_thresholds)  # [T]
+    T = len(thr_vec)
+
+    # Union of relation names
+    relation_names = set()
+    for names in relation_names_list:
+        if names:
+            relation_names.update(names)
+
+    if distances_list is None:
+        distances_list = [
+            compute_pairwise_distances(gt_coords, pred_coords)
+            for gt_coords, pred_coords in zip(gt_coords_list, pred_coords_list)
+        ]
+
+    tp_counts = {relation: np.zeros(T, dtype=np.float64) for relation in relation_names}
+    fp_counts = {relation: np.zeros(T, dtype=np.float64) for relation in relation_names}
+
+    for idx, (gt_coords, gt_labels, gt_relations, rel_names, pred_coords, pred_labels, pred_scores, pred_relations, max_dim) in enumerate(zip(
+        gt_coords_list, gt_labels_list, gt_relations_list, relation_names_list,
+        pred_coords_list, pred_labels_list, pred_scores_list, pred_relations_list, max_dim_list
+    )):
+        if len(gt_coords) == 0 or gt_relations is None or len(gt_relations) == 0 or pred_relations is None:
+            continue
+
+        distance_threshold_px = float(keypoint_distance_threshold) * float(max_dim)
+
+        # Filter predictions by keypoint score
+        keypoint_mask = pred_scores >= keypoint_score_threshold
+        if np.sum(keypoint_mask) < 2:
+            continue
+
+        filtered_indices = np.where(keypoint_mask)[0]
+        orig_to_filt = {orig_idx: i for i, orig_idx in enumerate(filtered_indices)}
+        distances = distances_list[idx]  # [G, P]
+
+        # Assign each prediction to closest valid GT within distance threshold
+        pred_to_best_gt = {}
+        for p in filtered_indices:
+            pred_label = pred_labels[p]
+            gt_mask = (gt_labels == pred_label)
+            if not np.any(gt_mask):
+                continue
+            dists_g = distances[:, p]
+            dists_masked = dists_g[gt_mask]
+            if dists_masked.size == 0:
+                continue
+            j_local = np.argmin(dists_masked)
+            min_dist = dists_masked[j_local]
+            if min_dist <= distance_threshold_px:
+                gt_candidates = np.where(gt_mask)[0]
+                gt_idx = gt_candidates[j_local]
+                pred_to_best_gt[p] = gt_idx
+
+        if len(pred_to_best_gt) < 2:
+            continue
+
+        assigned_pred_orig = sorted(pred_to_best_gt.keys())
+        assigned_gt = [pred_to_best_gt[p] for p in assigned_pred_orig]
+        pred_idx_filt = [orig_to_filt[o] for o in assigned_pred_orig]
+
+        filtered_pred_relations = pred_relations[keypoint_mask][:, keypoint_mask, :]  # [P', P', R]
+        K = len(assigned_pred_orig)
+        if K < 2:
+            continue
+
+        off_diag = ~np.eye(K, dtype=bool)
+
+        for rel_idx, rel_name in enumerate(rel_names or []):
+            gt_rel_matrix = np.array(gt_relations)[:, :, rel_idx]  # [G, G]
+            gt_sub = gt_rel_matrix[np.ix_(assigned_gt, assigned_gt)].astype(bool)  # [K, K]
+            pred_sub = filtered_pred_relations[np.ix_(pred_idx_filt, pred_idx_filt, [rel_idx])][:, :, 0]  # [K, K]
+
+            gt_flat = gt_sub[off_diag]
+            pred_scores_flat = pred_sub[off_diag]
+
+            pred_has_T = (pred_scores_flat[None, :] >= thr_vec[:, None])
+            gt_flat_row = gt_flat[None, :]
+
+            tp_counts[rel_name] += np.sum(pred_has_T & gt_flat_row, axis=1)
+            fp_counts[rel_name] += np.sum(pred_has_T & (~gt_flat_row), axis=1)
+
+    relation_curves = {}
+    for relation in relation_names:
+        tp = tp_counts[relation]
+        fp = fp_counts[relation]
+        denom_p = tp + fp
+        precision = np.divide(tp, denom_p, out=np.ones_like(tp), where=denom_p > 0)
+        relation_curves[relation] = {
+            'precision': precision.tolist(),
+            'thresholds': thr_vec.tolist()
+        }
+    return relation_curves
+
+
+def compute_relation_recall(
+    gt_coords_list,
+    gt_labels_list,
+    gt_relations_list,
+    relation_names_list,
+    pred_coords_list,
+    pred_labels_list,
+    pred_scores_list,
+    pred_relations_list,
+    max_dim_list,
+    keypoint_score_threshold,
+    keypoint_distance_threshold,
+    relation_score_thresholds=None,
+    distances_list=None
+):
+    """
+    Recall over relation score thresholds.
+
+    - Filter predictions by keypoint_score_threshold.
+    - Assign predictions to closest GT with same label within keypoint_distance_threshold.
+    - Denominator: number of GT relations (off-diagonal) only among GT keypoints that are
+      covered by at least one predicted keypoint above score and within distance threshold.
+    - For each GT relation, count at most one TP by max-aggregating predicted scores over all predicted
+      pairs mapping to that GT pair.
+    """
+    if relation_score_thresholds is None:
+        relation_score_thresholds = np.arange(0, 1.06, 0.05)
+
+    thr_vec = _as_1d_array(relation_score_thresholds)  # [T]
+    T = len(thr_vec)
+
+    # Union of relation names
+    relation_names = set()
+    for names in relation_names_list:
+        if names:
+            relation_names.update(names)
+
+    # Denominator: total GT relations per relation across images (initialized to 0)
+    gt_total_counts = {relation: 0.0 for relation in relation_names}
+
+    if distances_list is None:
+        distances_list = [
+            compute_pairwise_distances(gt_coords, pred_coords)
+            for gt_coords, pred_coords in zip(gt_coords_list, pred_coords_list)
+        ]
+
+    tp_counts = {relation: np.zeros(T, dtype=np.float64) for relation in relation_names}
+
+    for idx, (gt_coords, gt_labels, gt_relations, rel_names, pred_coords, pred_labels, pred_scores, pred_relations, max_dim) in enumerate(zip(
+        gt_coords_list, gt_labels_list, gt_relations_list, relation_names_list,
+        pred_coords_list, pred_labels_list, pred_scores_list, pred_relations_list, max_dim_list
+    )):
+        if len(gt_coords) == 0 or gt_relations is None or len(gt_relations) == 0 or pred_relations is None:
+            continue
+
+        distance_threshold_px = float(keypoint_distance_threshold) * float(max_dim)
+
+        # Filter predictions by keypoint score
+        keypoint_mask = pred_scores >= keypoint_score_threshold
+        if np.sum(keypoint_mask) < 2:
+            continue
+
+        filtered_indices = np.where(keypoint_mask)[0]
+        orig_to_filt = {orig_idx: i for i, orig_idx in enumerate(filtered_indices)}
+        distances = distances_list[idx]  # [G, P]
+
+        # Assign predictions to closest GT within distance threshold
+        pred_to_best_gt = {}
+        for p in filtered_indices:
+            pred_label = pred_labels[p]
+            gt_mask = (gt_labels == pred_label)
+            if not np.any(gt_mask):
+                continue
+            dists_g = distances[:, p]
+            dists_masked = dists_g[gt_mask]
+            if dists_masked.size == 0:
+                continue
+            j_local = np.argmin(dists_masked)
+            min_dist = dists_masked[j_local]
+            if min_dist <= distance_threshold_px:
+                gt_candidates = np.where(gt_mask)[0]
+                gt_idx = gt_candidates[j_local]
+                pred_to_best_gt[p] = gt_idx
+
+        if len(pred_to_best_gt) < 2:
+            continue
+
+        assigned_pred_orig = sorted(pred_to_best_gt.keys())
+        assigned_gt = [pred_to_best_gt[p] for p in assigned_pred_orig]
+        pred_idx_filt = [orig_to_filt[o] for o in assigned_pred_orig]
+
+        filtered_pred_relations = pred_relations[keypoint_mask][:, keypoint_mask, :]  # [P', P', R]
+        K = len(assigned_pred_orig)
+        if K < 2:
+            continue
+
+        # Group predictions by their assigned GT index
+        unique_gt_nodes, inv = np.unique(assigned_gt, return_inverse=True)  # inv: length K in [0..Gu-1]
+        Gu = len(unique_gt_nodes)
+        group_indices = [np.where(inv == g)[0] for g in range(Gu)]
+        off_diag_unique = ~np.eye(Gu, dtype=bool)
+
+        # New denominator: count only GT relations among GT nodes that have matched predictions
+        if rel_names and Gu >= 2:
+            gt_rel_arr = np.array(gt_relations, dtype=bool)  # [G, G, R]
+            for rel_idx, rel_name in enumerate(rel_names):
+                gt_sub_unique = gt_rel_arr[np.ix_(unique_gt_nodes, unique_gt_nodes, [rel_idx])][:, :, 0]
+                gt_total_counts[rel_name] += np.sum(gt_sub_unique[off_diag_unique])
+
+        if Gu < 2:
+            continue
+
+        for rel_idx, rel_name in enumerate(rel_names or []):
+            # GT submatrix on unique GT nodes
+            gt_rel_matrix = np.array(gt_relations)[:, :, rel_idx].astype(bool)  # [G, G]
+            gt_sub_unique = gt_rel_matrix[np.ix_(unique_gt_nodes, unique_gt_nodes)]  # [Gu, Gu]
+
+            # Predicted scores between matched predicted nodes for this relation
+            pred_sub = filtered_pred_relations[np.ix_(pred_idx_filt, pred_idx_filt, [rel_idx])][:, :, 0]  # [K, K]
+
+            # Max-aggregate predicted scores per GT pair to ensure at most one TP per GT relation
+            max_scores = np.full((Gu, Gu), -np.inf, dtype=pred_sub.dtype)
+            for gi, idx_i in enumerate(group_indices):
+                if idx_i.size == 0:
+                    continue
+                for gj, idx_j in enumerate(group_indices):
+                    if idx_j.size == 0:
+                        continue
+                    block = pred_sub[np.ix_(idx_i, idx_j)]
+                    if block.size:
+                        max_scores[gi, gj] = np.max(block)
+
+            # Evaluate TPs per threshold using off-diagonal pairs only
+            gt_flat = gt_sub_unique[off_diag_unique]
+            pred_max_flat = max_scores[off_diag_unique]
+            pred_has_T = (pred_max_flat[None, :] >= thr_vec[:, None])
+            gt_flat_row = gt_flat[None, :]
+
+            tp_counts[rel_name] += np.sum(pred_has_T & gt_flat_row, axis=1)
+
+    # Build recall curves
+    relation_curves = {}
+    for relation in relation_names:
+        tp = tp_counts[relation]
+        total_gt_rel = gt_total_counts.get(relation, 0.0)
+        recall = np.divide(tp, total_gt_rel, out=np.zeros_like(tp), where=total_gt_rel > 0)
+        relation_curves[relation] = {
+            'recall': recall.tolist(),
+            'thresholds': thr_vec.tolist()
+        }
+    return relation_curves
+
+
 def compute_precision_recall_relation(
     gt_coords_list,
     gt_labels_list,
@@ -199,131 +472,31 @@ def compute_precision_recall_relation(
     distances_list=None
 ):
     """
-    Compute precision-recall curves for relations over a list of images by varying relation score threshold.
-    Vectorized over relation_score_thresholds with numpy broadcasting.
+    Backward-compatible wrapper that merges precision and recall outputs.
     """
-    if relation_score_thresholds is None:
-        relation_score_thresholds = np.arange(0, 1.06, 0.05)
-
-    thr_vec = _as_1d_array(relation_score_thresholds)  # [T]
-    T = len(thr_vec)
-
-    # Collect union of relation names across images
-    relation_names = set()
-    for names in relation_names_list:
-        if names:
-            relation_names.update(names)
-
-    if distances_list is None:
-        distances_list = [
-            compute_pairwise_distances(gt_coords, pred_coords)
-            for gt_coords, pred_coords in zip(gt_coords_list, pred_coords_list)
-        ]
-
-    # Initialize global TP/FP/FN accumulators per relation (arrays of shape [T])
-    tp_counts = {relation: np.zeros(T, dtype=np.float64) for relation in relation_names}
-    fp_counts = {relation: np.zeros(T, dtype=np.float64) for relation in relation_names}
-    fn_counts = {relation: np.zeros(T, dtype=np.float64) for relation in relation_names}
-
-    for idx, (gt_coords, gt_labels, gt_relations, rel_names, pred_coords, pred_labels, pred_scores, pred_relations, max_dim) in enumerate(zip(
+    prec = compute_relation_precision(
         gt_coords_list, gt_labels_list, gt_relations_list, relation_names_list,
-        pred_coords_list, pred_labels_list, pred_scores_list, pred_relations_list, max_dim_list
-    )):
-        # Skip images without necessary data
-        if len(gt_coords) == 0 or gt_relations is None or len(gt_relations) == 0 or pred_relations is None:
-            continue
+        pred_coords_list, pred_labels_list, pred_scores_list, pred_relations_list,
+        max_dim_list, keypoint_score_threshold, keypoint_distance_threshold,
+        relation_score_thresholds, distances_list
+    )
+    rec = compute_relation_recall(
+        gt_coords_list, gt_labels_list, gt_relations_list, relation_names_list,
+        pred_coords_list, pred_labels_list, pred_scores_list, pred_relations_list,
+        max_dim_list, keypoint_score_threshold, keypoint_distance_threshold,
+        relation_score_thresholds, distances_list
+    )
 
-        distance_threshold_px = float(keypoint_distance_threshold) * float(max_dim)
-
-        # Filter predictions by keypoint score threshold
-        keypoint_mask = pred_scores >= keypoint_score_threshold
-        if np.sum(keypoint_mask) < 2:
-            continue
-
-        filtered_indices = np.where(keypoint_mask)[0]
-        orig_to_filt = {orig_idx: i for i, orig_idx in enumerate(filtered_indices)}
-
-        distances = distances_list[idx]
-
-        # For each GT keypoint, find the best matching prediction of the same label within distance
-        gt_to_best_pred = {}
-        for gt_i in range(len(gt_coords)):
-            gt_label = gt_labels[gt_i]
-            # valid preds: same label and pass score
-            matching_pred_mask = (pred_labels == gt_label) & keypoint_mask
-            if not np.any(matching_pred_mask):
-                continue
-            matching_pred_indices = np.where(matching_pred_mask)[0]
-            pred_distances = distances[gt_i, matching_pred_indices]
-            min_j = np.argmin(pred_distances)
-            min_dist = pred_distances[min_j]
-            if min_dist <= distance_threshold_px:
-                gt_to_best_pred[gt_i] = matching_pred_indices[min_j]
-
-        if len(gt_to_best_pred) < 2:
-            continue
-
-        assigned_gt = sorted(gt_to_best_pred.keys())
-        # map matched original pred indices -> filtered indices
-        pred_idx_orig = [gt_to_best_pred[i] for i in assigned_gt]
-        pred_idx_filt = [orig_to_filt[o] for o in pred_idx_orig]
-
-        # Subset predicted relations to filtered/matched nodes
-        filtered_pred_relations = pred_relations[keypoint_mask][:, keypoint_mask, :]  # [P', P', R]
-        K = len(assigned_gt)
-        if K < 2:
-            continue
-
-        # Off-diagonal mask for K x K matrices
-        off_diag = ~np.eye(K, dtype=bool)
-
-        # For each relation channel present in this image, accumulate counts vectorized over thresholds
-        for rel_idx, rel_name in enumerate(rel_names or []):
-
-            # Ground-truth submatrix for assigned GT nodes -> boolean
-            gt_rel_matrix = np.array(gt_relations)[:, :, rel_idx]  # [G, G]
-            gt_sub = gt_rel_matrix[np.ix_(assigned_gt, assigned_gt)].astype(bool)  # [K, K]
-
-            # Predicted relation scores submatrix (matched predicted nodes) for this relation
-            pred_sub = filtered_pred_relations[np.ix_(pred_idx_filt, pred_idx_filt, [rel_idx])][:, :, 0]  # [K, K]
-
-            # Flatten off-diagonal pairs
-            gt_flat = gt_sub[off_diag]                    # [N_pairs]
-            pred_scores_flat = pred_sub[off_diag]         # [N_pairs]
-
-            # Broadcast thresholds: [T, N_pairs]
-            pred_has_T = (pred_scores_flat[None, :] >= thr_vec[:, None])
-            gt_flat_row = gt_flat[None, :]  # [1, N_pairs]
-
-            # Accumulate TP/FP/FN across thresholds
-            tp_counts[rel_name] += np.sum(pred_has_T & gt_flat_row, axis=1)
-            fp_counts[rel_name] += np.sum(pred_has_T & (~gt_flat_row), axis=1)
-            fn_counts[rel_name] += np.sum((~pred_has_T) & gt_flat_row, axis=1)
-
-    # Build curves
-    relation_curves = {}
-    for relation in relation_names:
-        tp = tp_counts[relation]
-        fp = fp_counts[relation]
-        fn = fn_counts[relation]
-
-        denom_p = tp + fp
-        precision = np.divide(tp, denom_p, out=np.ones_like(tp), where=denom_p > 0)
-
-        denom_r = tp + fn
-        recall = np.divide(tp, denom_r, out=np.zeros_like(tp), where=denom_r > 0)
-
-        denom_f = precision + recall
-        f1 = np.divide(2 * precision * recall, denom_f, out=np.zeros_like(denom_f), where=denom_f > 0)
-
-        relation_curves[relation] = {
-            'precision': precision.tolist(),
-            'recall': recall.tolist(),
-            'f1': f1.tolist(),
-            'thresholds': thr_vec.tolist()
+    # Merge per relation
+    relations = set(prec.keys()) | set(rec.keys())
+    merged = {}
+    for r in relations:
+        merged[r] = {
+            'precision': prec.get(r, {}).get('precision', []),
+            'recall': rec.get(r, {}).get('recall', []),
+            'thresholds': prec.get(r, {}).get('thresholds', rec.get(r, {}).get('thresholds', []))
         }
-
-    return relation_curves
+    return merged
 
 
 def compute_pck(gt_coords, pred_coords, matchings, img_width, img_height, pck_threshold=0.05):

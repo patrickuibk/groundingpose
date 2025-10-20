@@ -189,6 +189,43 @@ def _fmt_thr(value, max_decimals=4):
     except Exception:
         return str(value)
 
+def _pr_auc(recall, precision):
+    """
+    Compute area under the PR curve using trapezoidal integration over recall.
+    Handles NaNs and sorts by recall to ensure non-decreasing integration axis.
+    """
+    rec = np.asarray(recall, dtype=float)
+    prec = np.asarray(precision, dtype=float)
+    mask = ~np.isnan(rec) & ~np.isnan(prec)
+    rec = rec[mask]
+    prec = prec[mask]
+    if rec.size == 0:
+        return 0.0
+    order = np.argsort(rec)
+    rec = rec[order]
+    prec = prec[order]
+    return float(np.trapz(prec, rec))
+
+def _dataset_colors(n):
+    """
+    Return a list of RGBA colors for n datasets using matplotlib colormaps.
+    Uses tab10 for up to 10 colors, otherwise falls back to tab20 with n discrete samples.
+    """
+    base = list(plt.cm.tab10.colors)
+    if n <= len(base):
+        return [base[i % len(base)] for i in range(n)]
+    # Use a discrete tab20 colormap to generate n distinct colors
+    cmap = plt.cm.get_cmap('tab20', n)
+    return [cmap(i) for i in range(n)]
+
+def _add_panel_labels(axes, labels=('a)', 'b)', 'c)'), x=0.01, y=0.99, fontsize=12, fontweight='bold'):
+    ax_list = np.ravel(axes)
+    for ax, lab in zip(ax_list, labels):
+        if ax is None:
+            continue
+        ax.text(x, y, lab, transform=ax.transAxes, ha='left', va='top',
+                fontsize=fontsize, fontweight=fontweight)
+
 def plot_pr_series(
     ax,
     series,
@@ -196,7 +233,6 @@ def plot_pr_series(
     xlabel='Recall',
     ylabel='Precision',
     legend_loc='lower left',
-    f1_at=None,
     highlight_interval=None,
     legend_interval_label=None,
     highlight_point=None,
@@ -206,26 +242,20 @@ def plot_pr_series(
     Generic PR plotting utility.
     - series: list of dicts with keys:
         { 'recall': np.ndarray, 'precision': np.ndarray, 'thresholds': np.ndarray, 'label': str, 'color': optional }
-    - f1_at: scalar threshold value at which to append F1 to legend labels (if present in thresholds)
+    - Legend automatically appends AUC computed over (recall, precision).
     - highlight_interval: (low, high) to draw a thick segment of the PR curve over that thresholds range
     - highlight_point: scalar threshold to mark as a single point on the PR curve
     """
     colors = plt.cm.tab10.colors
-
     for i, s in enumerate(series):
         rec = np.asarray(s['recall'])
         prec = np.asarray(s['precision'])
         thr = np.asarray(s['thresholds'])
-        color = s.get('color', colors[i % len(colors)])
+        color = s.get('color', colors[i % len(colors)])  # respects provided color
 
-        # Label with F1@value if requested
-        label = s['label']
-        if f1_at is not None and np.any(np.isclose(thr, f1_at)):
-            idx = np.where(np.isclose(thr, f1_at))[0][0]
-            p, r = prec[idx], rec[idx]
-            f1 = 2 * p * r / (p + r) if (p + r) > 0 else 0.0
-            # Compact threshold formatting without trailing zeros
-            label = f"{label} (F1@{_fmt_thr(f1_at)}={f1:.2f})"
+        # Append AUC to legend label
+        auc = _pr_auc(rec, prec)
+        label = f"{s['label']} (AUC={auc:.2f})"
 
         ax.plot(rec, prec, label=label, color=color)
 
@@ -260,13 +290,14 @@ def plot_pr_series(
     ax.set_ylim(0, 1.05)
     ax.legend(loc=legend_loc)
 
-def plot_keypoint_pr_curve(ax, all_keypoint_pr_data, categories, dataset_names, keypoint_score_threshold, keypoint_distance_threshold):
+def plot_keypoint_pr_curve(ax, all_keypoint_pr_data, categories, dataset_names, keypoint_score_threshold, keypoint_distance_threshold, dataset_colors=None):
     """
     Plot Keypoint Precision-Recall curves on the given axis.
-    Legend shows F1 at fixed keypoint_score_threshold.
+    Legend shows AUC for each dataset.
     Highlights the threshold interval [0.2, 0.8].
     """
     series = []
+    colors = dataset_colors or _dataset_colors(len(categories))
     for idx, category in enumerate(categories):
         if category not in all_keypoint_pr_data:
             continue
@@ -276,24 +307,25 @@ def plot_keypoint_pr_curve(ax, all_keypoint_pr_data, categories, dataset_names, 
             'precision': np.asarray(precisions),
             'thresholds': np.asarray(score_thresholds),
             'label': dataset_names[idx],
+            'color': colors[idx],
         })
 
     plot_pr_series(
         ax,
         series=series,
         title=f'Keypoint Precision-Recall Curve\n(Score Threshold in [0, 1], Distance Threshold: {keypoint_distance_threshold})',
-        f1_at=keypoint_score_threshold,
         highlight_interval=(0.2, 0.8),
         legend_interval_label='Score interval [0.2, 0.8]'
     )
 
-def plot_relation_pr_curve(ax, all_relation_pr_data, categories, dataset_names, keypoint_score_threshold, keypoint_distance_threshold):
+def plot_relation_pr_curve(ax, all_relation_pr_data, categories, dataset_names, keypoint_score_threshold, keypoint_distance_threshold, dataset_colors=None):
     """
     Plot Relation Precision-Recall curves averaged over relation types per category.
-    Legend shows F1 at fixed keypoint_score_threshold.
+    Legend shows AUC for each dataset.
     Highlights interval [0.2, 0.8].
     """
     series = []
+    colors = dataset_colors or _dataset_colors(len(categories))
     for idx, category in enumerate(categories):
         if category not in all_relation_pr_data:
             continue
@@ -317,24 +349,24 @@ def plot_relation_pr_curve(ax, all_relation_pr_data, categories, dataset_names, 
             'precision': np.asarray(avg_precision),
             'thresholds': thresholds_arr,
             'label': dataset_names[idx],
+            'color': colors[idx],
         })
 
     plot_pr_series(
         ax,
         series=series,
         title=f'Relation Precision-Recall Curve\n(Score Threshold: {keypoint_score_threshold}, Distance Threshold: {keypoint_distance_threshold})',
-        f1_at=keypoint_score_threshold,
         highlight_interval=(0.2, 0.8),
         legend_interval_label='Score interval [0.2, 0.8]'
     )
 
-def plot_keypoint_pr_distance_curve(ax, all_keypoint_pr_dist_data, categories, dataset_names, keypoint_score_threshold):
+def plot_keypoint_pr_distance_curve(ax, all_keypoint_pr_dist_data, categories, dataset_names, keypoint_score_threshold, dataset_colors=None):
     """
     Plot Keypoint Precision-Recall curves by varying distance thresholds on the given axis.
-    Highlights only the single threshold 0.005 and reports F1@0.005.
+    Legend shows AUC for each dataset and highlights the single threshold 0.005.
     """
-    f1_dist = 0.005
     series = []
+    colors = dataset_colors or _dataset_colors(len(categories))
     for idx, category in enumerate(categories):
         if category not in all_keypoint_pr_dist_data:
             continue
@@ -344,14 +376,14 @@ def plot_keypoint_pr_distance_curve(ax, all_keypoint_pr_dist_data, categories, d
             'precision': np.asarray(precisions),
             'thresholds': np.asarray(distance_thresholds),
             'label': dataset_names[idx],
+            'color': colors[idx],
         })
 
     plot_pr_series(
         ax,
         series=series,
         title=f'Keypoint Precision-Recall Curve\n(Distance Threshold in [0, 1], Score Threshold: {keypoint_score_threshold})',
-        f1_at=f1_dist,
-        highlight_point=f1_dist,
+        highlight_point=0.005,
         legend_point_label='Distance Threshold 0.005'
     )
 
@@ -366,18 +398,30 @@ def plot_model_metrics(
     
     fig, axes = plt.subplots(1, 3, figsize=(18, 6))
     dataset_names = [f'Dataset {i+1}' for i in range(len(categories))]
+    dataset_colors = _dataset_colors(len(categories))
 
     # Plot 1: Keypoint Precision-Recall curves (by score)
-    plot_keypoint_pr_curve(axes[0], all_keypoint_pr_data, categories, dataset_names, 
-                           keypoint_score_threshold, keypoint_distance_threshold)
+    plot_keypoint_pr_curve(
+        axes[0], all_keypoint_pr_data, categories, dataset_names,
+        keypoint_score_threshold, keypoint_distance_threshold,
+        dataset_colors=dataset_colors
+    )
 
     # Plot 2: Keypoint Precision-Recall by distance threshold
-    plot_keypoint_pr_distance_curve(axes[1], all_keypoint_pr_dist_data, categories, dataset_names,
-                                   keypoint_score_threshold)
+    plot_keypoint_pr_distance_curve(
+        axes[1], all_keypoint_pr_dist_data, categories, dataset_names,
+        keypoint_score_threshold, dataset_colors=dataset_colors
+    )
 
     # Plot 3: Relation Precision-Recall curves
-    plot_relation_pr_curve(axes[2], all_relation_pr_data, categories, dataset_names, 
-                           keypoint_score_threshold, keypoint_distance_threshold)
+    plot_relation_pr_curve(
+        axes[2], all_relation_pr_data, categories, dataset_names,
+        keypoint_score_threshold, keypoint_distance_threshold,
+        dataset_colors=dataset_colors
+    )
+
+    # Add subplot labels: a, b, c
+    _add_panel_labels(axes, labels=('a)', 'b)', 'c)'))
     
     plt.tight_layout()
     plt.savefig(os.path.join(plots_dir, f'{model_type}_metrics.png'), dpi=300, bbox_inches='tight')
@@ -397,6 +441,7 @@ def plot_model_comparison(
 ):
     """
     Create plots comparing different model types by aggregating data across datasets.
+    Legends show AUC for each model type.
     Uses generalized PR plotting to avoid duplication.
     """
     print(f"Plotting model comparison...")
@@ -474,13 +519,11 @@ def plot_model_comparison(
         axes[0],
         series=series,
         title=f'Keypoint Precision-Recall Curve\n(Score Threshold in [0, 1], Distance Threshold: {keypoint_distance_threshold})',
-        f1_at=keypoint_score_threshold,
         highlight_interval=(0.2, 0.8),
         legend_interval_label='Score interval [0.2, 0.8]'
     )
 
     # 2) Keypoint PR (distance)
-    f1_dist = 0.005
     series = []
     for model_type in model_types:
         if model_type not in all_model_keypoint_pr_dist_data:
@@ -495,8 +538,7 @@ def plot_model_comparison(
         axes[1],
         series=series,
         title=f'Keypoint Precision-Recall Curve\n(Distance Threshold in [0, 1], Score Threshold: {keypoint_score_threshold})',
-        f1_at=f1_dist,
-        highlight_point=f1_dist,
+        highlight_point=0.005,
         legend_point_label='Distance Threshold 0.005'
     )
 
@@ -515,12 +557,15 @@ def plot_model_comparison(
         axes[2],
         series=series,
         title=f'Relation Precision-Recall Curve\n(Score Threshold: {keypoint_score_threshold}, Distance Threshold: {keypoint_distance_threshold})',
-        f1_at=keypoint_score_threshold,
         highlight_interval=(0.2, 0.8),
         legend_interval_label='Score interval [0.2, 0.8]'
     )
 
     plt.tight_layout()
+
+    # Add subplot labels: a, b, c
+    _add_panel_labels(axes, labels=('a)', 'b)', 'c)'))
+
     plt.savefig(os.path.join(plots_dir, 'model_comparison.png'), dpi=300, bbox_inches='tight')
     plt.close(fig)
     return fig
